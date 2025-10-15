@@ -38,7 +38,6 @@ from bugzooka.integrations.mcp_client import (
     initialize_global_resources_async,
 )
 from bugzooka.integrations.gemini_client import analyze_log_with_gemini
-from bugzooka.core.config import ANALYSIS_MODE
 from bugzooka.analysis.prow_analyzer import analyze_prow_artifacts
 from bugzooka.core.utils import extract_job_details
 
@@ -141,7 +140,7 @@ def filter_errors_with_llm(errors_list, requires_llm, product_config):
 
 
 def run_agent_analysis(error_summary, product, product_config):
-    """Run agent analysis on the error summary."""
+    """Run agent analysis on the error summary, with Gemini as fallback."""
     retry_config = product_config.get("retry", {})
 
     @retry(
@@ -157,28 +156,34 @@ def run_agent_analysis(error_summary, product, product_config):
         reraise=True,
     )
     def _run_agent_analysis():
-        if ANALYSIS_MODE == "gemini":
-            logger.info("Using Gemini analysis mode")
-            response = analyze_log_with_gemini(product, product_config, error_summary)
-            return response
-        else:
-            logger.info("Using agent-based analysis mode")
-            # This is where the core fix is applied.
-            # We must use asyncio.run to execute the async code.
+        # First try: Use generic inference endpoint (agent-based analysis)
+        logger.info("Attempting analysis with generic inference endpoint")
+        try:
+            # Execute the async function using asyncio.run
+            return asyncio.run(_run_agent_analysis_async(error_summary, product, product_config))
+        except InferenceAPIUnavailableError as e:
+            # First attempt failed, try Gemini as fallback
+            logger.warning("Generic inference failed (%s), falling back to Gemini", str(e))
             try:
-                # Execute the async function using asyncio.run
-                return asyncio.run(_run_fallback_agent_analysis_async(error_summary, product, product_config))
-            except Exception as e:
-                # This catches any unhandled exception (network, API, LangChain internal)
-                # and explicitly re-raises it with a message, preventing the silent failure.
-                # This ensures the tenacity decorator receives a proper exception.
-                logger.error("Unexpected error during async agent execution: %s", str(e), exc_info=True)
+                logger.info("Using Gemini as fallback analysis mode")
+                response = analyze_log_with_gemini(product, product_config, error_summary)
+                return response
+            except Exception as gemini_error:
+                # Both attempts failed
+                logger.error("Gemini fallback also failed: %s", str(gemini_error))
                 raise InferenceAPIUnavailableError(
-                    f"Unhandled error during agent analysis: {type(e).__name__}: {str(e)}"
-                ) from e
+                    f"Both generic inference and Gemini fallback failed. "
+                    f"Generic error: {str(e)}. Gemini error: {str(gemini_error)}"
+                ) from gemini_error
+        except Exception as e:
+            # Unexpected error from agent execution
+            logger.error("Unexpected error during async agent execution: %s", str(e), exc_info=True)
+            raise InferenceAPIUnavailableError(
+                f"Unhandled error during agent analysis: {type(e).__name__}: {str(e)}"
+            ) from e
 
-    async def _run_fallback_agent_analysis_async(error_summary, product, product_config):
-        """Fallback to agent-based analysis if direct Gemini call fails."""
+    async def _run_agent_analysis_async(error_summary, product, product_config):
+        """Execute agent-based analysis using the generic inference endpoint."""
 
         global mcp_client, mcp_tools
         if mcp_client is None:
